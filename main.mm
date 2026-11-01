@@ -159,29 +159,33 @@ public:
 };
 
 // ============================================================
-// SAFE MACH-O INSPECTION & SINGLE-SLIDE RESOLUTION (FIXED)
+// SAFE MACH-O UNIVERSAL IMAGE SCANNER
 // ============================================================
 
 static uintptr_t GetVerifiedTargetAddress(uintptr_t rva) {
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 0; i < count; ++i) {
         const char *name = _dyld_get_image_name(i);
-        if (name && (strstr(name, "UnityFramework") || strstr(name, "GhostSoulM"))) {
-            const mach_header *rawHeader = _dyld_get_image_header(i);
-            if (rawHeader && rawHeader->magic == MH_MAGIC_64) {
-                const auto *header = reinterpret_cast<const mach_header_64 *>(rawHeader);
+        if (!name) continue;
+
+        if (strstr(name, "/System/") || strstr(name, "/usr/lib/") || strstr(name, "UIKit") || strstr(name, "Foundation")) {
+            continue;
+        }
+
+        const mach_header *rawHeader = _dyld_get_image_header(i);
+        if (rawHeader && rawHeader->magic == MH_MAGIC_64) {
+            const auto *header = reinterpret_cast<const mach_header_64 *>(rawHeader);
+            
+            unsigned long size = 0;
+            uint8_t *section = getsectiondata(header, "__TEXT", "__text", &size);
+            if (section && size > 0) {
+                uintptr_t candidate = reinterpret_cast<uintptr_t>(header) + rva;
+                uintptr_t sectStart = reinterpret_cast<uintptr_t>(section);
+                uintptr_t sectEnd   = sectStart + size;
                 
-                unsigned long size = 0;
-                uint8_t *section = getsectiondata(header, "__TEXT", "__text", &size);
-                if (section && size > 0) {
-                    // header & section ĐÃ slide sẵn từ runtime -> KHÔNG cộng slide lần nữa
-                    uintptr_t candidate = reinterpret_cast<uintptr_t>(header) + rva;
-                    uintptr_t sectStart = reinterpret_cast<uintptr_t>(section);
-                    uintptr_t sectEnd   = sectStart + size;
-                    
-                    if (candidate >= sectStart && candidate < sectEnd) {
-                        return candidate;
-                    }
+                if (candidate >= sectStart && candidate < sectEnd) {
+                    LOG_MESSAGE(std::string("Found target image: ") + name);
+                    return candidate;
                 }
             }
         }
@@ -208,7 +212,7 @@ static OriginalSetfAttackSpeed orig_SetfAttackSpeed = nullptr;
 static OriginalSendPlayerSkill orig_SendPlayerSkill = nullptr;
 static OriginalSendPlayerAttack orig_SendPlayerAttack = nullptr;
 
-// Live Hook Replacements with Diagnostic Logging
+// Live Hook Replacements
 void hooked_SetfSpeed(void *instance, float speed) {
     MenuSettings s = SettingsStore::shared().snapshot();
     speed *= s.speedMultiplier;
@@ -227,13 +231,13 @@ void hooked_SendPlayerDead(void *instance) {
 void hooked_SendPlayerDamage(void *instance, float damage) {
     MenuSettings s = SettingsStore::shared().snapshot();
     damage *= s.damageMultiplier;
-    if (orig_SendPlayerDamage) orig_SendPlayerDamage(instance, damage);
+    if (orig_SetfDamage) orig_SetfDamage(instance, damage);
 }
 
 void hooked_SendPlayerDefence(void *instance, float defense) {
     MenuSettings s = SettingsStore::shared().snapshot();
     if (s.defenseBoost) defense *= 5.0f;
-    if (orig_SendPlayerDefence) orig_SendPlayerDefence(instance, defense);
+    if (orig_SetfDefence) orig_SetfDefence(instance, defense);
 }
 
 void hooked_SetfMaxHP(void *instance, float hp) {
@@ -276,10 +280,7 @@ static void SetupRuntimeHooksWithRetry(int retriesLeft) {
                     LOG_MESSAGE(std::string("Resolved " #name ": 0x") + std::to_string(addr) + \
                                 " -> symbol: " + (info.dli_sname ? info.dli_sname : "?") + \
                                 " in image: " + (info.dli_fname ? info.dli_fname : "?")); \
-                } else { \
-                    LOG_MESSAGE("Warning: dladdr failed for " #name " at 0x" + std::to_string(addr)); \
                 } \
-                \
                 uintptr_t page_size = sysconf(_SC_PAGESIZE); \
                 uintptr_t page_start = addr & ~(page_size - 1); \
                 mprotect((void*)page_start, page_size, PROT_READ | PROT_WRITE | PROT_EXEC); \
@@ -324,35 +325,6 @@ static void SetupRuntimeHooksWithRetry(int retriesLeft) {
 }
 
 // ============================================================
-// OVERLAY WINDOW (PASSTHROUGH FIX)
-// ============================================================
-
-@interface PassThroughWindow : UIWindow
-@end
-
-@implementation PassThroughWindow
-
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hit = [super hitTest:point withEvent:event];
-
-    if (hit == self || hit == self.rootViewController.view) {
-        for (UIView *subview in self.rootViewController.view.subviews) {
-            if (!subview.hidden && subview.alpha > 0.01) {
-                CGPoint convertedPoint = [subview convertPoint:point fromView:self];
-                if ([subview pointInside:convertedPoint withEvent:event]) {
-                    return [subview hitTest:convertedPoint withEvent:event];
-                }
-            }
-        }
-        return nil;
-    }
-
-    return hit;
-}
-
-@end
-
-// ============================================================
 // MENU CONTROLLER
 // ============================================================
 
@@ -384,6 +356,7 @@ static void SetupRuntimeHooksWithRetry(int retriesLeft) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = UIColor.clearColor;
+    self.view.userInteractionEnabled = YES;
 
     [self buildPanel];
     [self buildFloatingButton];
@@ -430,6 +403,7 @@ static void SetupRuntimeHooksWithRetry(int retriesLeft) {
     self.floatButton.layer.cornerRadius = 29;
     self.floatButton.layer.borderWidth = 2;
     self.floatButton.layer.borderColor = UIColor.whiteColor.CGColor;
+    self.floatButton.userInteractionEnabled = YES;
 
     [self.floatButton addTarget:self action:@selector(buttonDown:withEvent:) forControlEvents:UIControlEventTouchDown];
     [self.floatButton addTarget:self action:@selector(buttonDragged:withEvent:) forControlEvents:UIControlEventTouchDragInside | UIControlEventTouchDragOutside];
@@ -480,6 +454,7 @@ static void SetupRuntimeHooksWithRetry(int retriesLeft) {
     self.panel.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.2].CGColor;
     self.panel.clipsToBounds = YES;
     self.panel.hidden = YES;
+    self.panel.userInteractionEnabled = YES;
     [self.view addSubview:self.panel];
 
     self.header = [[UIView alloc] initWithFrame:CGRectZero];
@@ -508,6 +483,7 @@ static void SetupRuntimeHooksWithRetry(int retriesLeft) {
 
     self.scrollView = [[UIScrollView alloc] initWithFrame:CGRectZero];
     self.scrollView.alwaysBounceVertical = YES;
+    self.scrollView.userInteractionEnabled = YES;
     [self.panel addSubview:self.scrollView];
 
     [self buildSettings];
@@ -724,13 +700,31 @@ static void SetupRuntimeHooksWithRetry(int retriesLeft) {
     }
 }
 
+// Cho phép chạm xuyên qua các vùng trống của menu để chơi game bình thường
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    if (hit == self.view) {
+        // Nếu bấm vào nút nổi thì nhận
+        if (CGRectContainsPoint(self.floatButton.frame, [self.floatButton convertPoint:point fromView:self.view])) {
+            return [self.floatButton hitTest:[self.floatButton convertPoint:point fromView:self.view] withEvent:event];
+        }
+        // Nếu panel đang mở và bấm vào panel thì nhận
+        if (!self.panel.hidden && CGRectContainsPoint(self.panel.frame, [self.panel convertPoint:point fromView:self.view])) {
+            return [self.panel hitTest:[self.panel convertPoint:point fromView:self.view] withEvent:event];
+        }
+        // Ngược lại cho chạm xuyên qua bàn phím/màn hình game ở bên dưới
+        return nil;
+    }
+    return hit;
+}
+
 @end
 
 // ============================================================
-// WINDOW MANAGEMENT
+// WINDOW MANAGEMENT (DIRECT KEYWINDOW INJECTION)
 // ============================================================
 
-static PassThroughWindow *gOverlayWindow = nil;
+static OverlayController *gOverlayController = nil;
 
 static void PresentOverlay(void) {
     if (![NSThread isMainThread]) {
@@ -740,32 +734,47 @@ static void PresentOverlay(void) {
         return;
     }
 
-    if (gOverlayWindow) return;
+    if (gOverlayController) return;
 
-    UIWindowScene *activeScene = nil;
-    @try {
-        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-            if ([scene isKindOfClass:UIWindowScene.class] &&
-                scene.activationState == UISceneActivationStateForegroundActive) {
-                activeScene = (UIWindowScene *)scene;
-                break;
-            }
+    UIWindow *targetWindow = nil;
+    for (UIWindow *window in UIApplication.sharedApplication.windows) {
+        if (window.isKeyWindow) {
+            targetWindow = window;
+            break;
         }
-    } @catch (__unused NSException *e) {}
-
-    if (activeScene) {
-        gOverlayWindow = [[PassThroughWindow alloc] initWithWindowScene:activeScene];
-        gOverlayWindow.frame = activeScene.coordinateSpace.bounds;
-    } else {
-        gOverlayWindow = [[PassThroughWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
     }
 
-    gOverlayWindow.backgroundColor = UIColor.clearColor;
-    gOverlayWindow.windowLevel = UIWindowLevelAlert + 999;
-    gOverlayWindow.rootViewController = [[OverlayController alloc] init];
-    gOverlayWindow.hidden = NO;
+    if (!targetWindow) {
+        targetWindow = UIApplication.sharedApplication.keyWindow;
+    }
 
-    LOG_MESSAGE("Overlay initialized with passthrough touch handling.");
+    if (!targetWindow && @available(iOS 13.0, *)) {
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if ([scene isKindOfClass:UIWindowScene.class]) {
+                UIWindowScene *windowScene = (UIWindowScene *)scene;
+                for (UIWindow *window in windowScene.windows) {
+                    if (window.isKeyWindow) {
+                        targetWindow = window;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!targetWindow) {
+        LOG_MESSAGE("Error: No keyWindow found for direct injection.");
+        return;
+    }
+
+    gOverlayController = [[OverlayController alloc] init];
+    gOverlayController.view.frame = targetWindow.bounds;
+    gOverlayController.view.backgroundColor = UIColor.clearColor;
+
+    [targetWindow addSubview:gOverlayController.view];
+    [targetWindow bringSubviewToFront:gOverlayController.view];
+
+    LOG_MESSAGE("Overlay successfully injected directly into game keyWindow.");
 }
 
 // ============================================================
@@ -776,14 +785,14 @@ __attribute__((constructor))
 static void sheepct_entry(void) {
     @autoreleasepool {
         SafeLogger::shared().initialize();
-        LOG_MESSAGE("=== SHEEPCT MODULE LOADED (SINGLE-SLIDE FIX) ===");
+        LOG_MESSAGE("=== SHEEPCT MODULE LOADED (DIRECT KEYWINDOW FIX) ===");
 
         dispatch_async(dispatch_get_main_queue(), ^{
             PresentOverlay();
         });
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            LOG_MESSAGE("Executing single-slide verified hook setup...");
+            LOG_MESSAGE("Executing hook setup on direct window...");
             SetupRuntimeHooksWithRetry(5);
         });
     }
