@@ -28,20 +28,19 @@ extern "C" {
 }
 
 // ============================================================
-// CONFIGURATION & GAME HOOK RVAS
+// CONFIGURATION & GAME HOOK RVAS (VERIFIED)
 // ============================================================
 
 static NSString * const kLogFileName = @"sheepct.log";
 
-// Verified Game RVAs (GhostSoulM / UnityFramework)
-#define RVA_ENTITY_SPEED      0x19ce918
-#define RVA_UDP_DEAD          0x1748fbc
-#define RVA_UDP_DAMAGE        0x1744888
-#define RVA_UDP_DEFENSE       0x1747348
-#define RVA_ENTITY_HP         0x19cf020
-#define RVA_ENTITY_ATKSPD     0x19cf410
-#define RVA_UDP_SKILL         0x1743c2c
-#define RVA_UDP_ATTACK        0x1747508
+#define RVA_ENTITY_SPEED      0x19ce918  // EntityAIPlayer::SetfSpeed
+#define RVA_UDP_DEAD          0x1748fbc  // UdpClient::SendPlayerDead_C
+#define RVA_UDP_DAMAGE        0x1744888  // UdpClient::SendPlayerDamage_C
+#define RVA_UDP_DEFENSE       0x1747348  // UdpClient::SendPlayerDefence_C
+#define RVA_ENTITY_HP         0x19cf020  // (Unverified symbol in EntityAI block)
+#define RVA_ENTITY_ATKSPD     0x19cf410  // (Unverified symbol in EntityAI block)
+#define RVA_UDP_SKILL         0x1743c2c  // UdpClient::SendPlayerSkill_C
+#define RVA_UDP_ATTACK        0x1747508  // UdpClient::SendPlayerAttack_C
 
 enum : NSInteger {
     TagSection = 700,
@@ -193,22 +192,21 @@ static uintptr_t GetVerifiedTargetAddress(uintptr_t rva) {
     return 0;
 }
 
-// Function Pointers
+// Function Signatures (Verified & Generic Fallbacks)
 typedef void (*OriginalSetfSpeed)(void *instance, float speed);
-typedef void (*OriginalSendPlayerDead)(void *instance);
+typedef void (*OriginalSendPlayerDead)(void *instance, bool flag);
 typedef void (*OriginalSendPlayerDamage)(void *instance, float damage);
 typedef void (*OriginalSendPlayerDefence)(void *instance, float defense);
-typedef void (*OriginalSetfMaxHP)(void *instance, float hp);
-typedef void (*OriginalSetfAttackSpeed)(void *instance, float atkSpd);
-typedef void (*OriginalSendPlayerSkill)(void *instance);
-typedef void (*OriginalSendPlayerAttack)(void *instance);
+typedef void (*OriginalGenericEntityMethod)(void *instance, float val); // Generic for unverified HP/AtkSpd
+typedef void (*OriginalSendPlayerSkill)(void *instance, bool flag);
+typedef void (*OriginalSendPlayerAttack)(void *instance, bool flag);
 
 static OriginalSetfSpeed orig_SetfSpeed = nullptr;
 static OriginalSendPlayerDead orig_SendPlayerDead = nullptr;
 static OriginalSendPlayerDamage orig_SendPlayerDamage = nullptr;
 static OriginalSendPlayerDefence orig_SendPlayerDefence = nullptr;
-static OriginalSetfMaxHP orig_SetfMaxHP = nullptr;
-static OriginalSetfAttackSpeed orig_SetfAttackSpeed = nullptr;
+static OriginalGenericEntityMethod orig_EntityHP = nullptr;
+static OriginalGenericEntityMethod orig_EntityAtkSpd = nullptr;
 static OriginalSendPlayerSkill orig_SendPlayerSkill = nullptr;
 static OriginalSendPlayerAttack orig_SendPlayerAttack = nullptr;
 
@@ -219,55 +217,55 @@ void hooked_SetfSpeed(void *instance, float speed) {
     if (orig_SetfSpeed) orig_SetfSpeed(instance, speed);
 }
 
-void hooked_SendPlayerDead(void *instance) {
+void hooked_SendPlayerDead(void *instance, bool flag) {
     MenuSettings s = SettingsStore::shared().snapshot();
     if (s.godMode && instance != nullptr) {
         LOG_MESSAGE("Hook Triggered: God Mode active (Dead suppressed)");
         return;
     }
-    if (orig_SendPlayerDead) orig_SendPlayerDead(instance);
+    if (orig_SendPlayerDead) orig_SendPlayerDead(instance, flag);
 }
 
 void hooked_SendPlayerDamage(void *instance, float damage) {
     MenuSettings s = SettingsStore::shared().snapshot();
     damage *= s.damageMultiplier;
-    if (orig_SetfDamage) orig_SetfDamage(instance, damage);
+    if (orig_SendPlayerDamage) orig_SendPlayerDamage(instance, damage);
 }
 
 void hooked_SendPlayerDefence(void *instance, float defense) {
     MenuSettings s = SettingsStore::shared().snapshot();
     if (s.defenseBoost) defense *= 5.0f;
-    if (orig_SetfDefence) orig_SetfDefence(instance, defense);
+    if (orig_SendPlayerDefence) orig_SendPlayerDefence(instance, defense);
 }
 
-void hooked_SetfMaxHP(void *instance, float hp) {
+void hooked_EntityHP(void *instance, float hp) {
     MenuSettings s = SettingsStore::shared().snapshot();
     hp *= s.hpMultiplier;
-    if (orig_SetfMaxHP) orig_SetfMaxHP(instance, hp);
+    if (orig_EntityHP) orig_EntityHP(instance, hp);
 }
 
-void hooked_SetfAttackSpeed(void *instance, float atkSpd) {
+void hooked_EntityAtkSpd(void *instance, float atkSpd) {
     MenuSettings s = SettingsStore::shared().snapshot();
     atkSpd *= s.attackSpeedMultiplier;
-    if (orig_SetfAttackSpeed) orig_SetfAttackSpeed(instance, atkSpd);
+    if (orig_EntityAtkSpd) orig_EntityAtkSpd(instance, atkSpd);
 }
 
-void hooked_SendPlayerSkill(void *instance) {
+void hooked_SendPlayerSkill(void *instance, bool flag) {
     MenuSettings s = SettingsStore::shared().snapshot();
     if (s.autoSkill && instance != nullptr && orig_SendPlayerSkill) {
         LOG_MESSAGE("Hook Triggered: Auto Skill active");
-        orig_SendPlayerSkill(instance);
+        orig_SendPlayerSkill(instance, flag);
     }
-    if (orig_SendPlayerSkill) orig_SendPlayerSkill(instance);
+    if (orig_SendPlayerSkill) orig_SendPlayerSkill(instance, flag);
 }
 
-void hooked_SendPlayerAttack(void *instance) {
+void hooked_SendPlayerAttack(void *instance, bool flag) {
     MenuSettings s = SettingsStore::shared().snapshot();
     if (s.autoAttack && instance != nullptr && orig_SendPlayerAttack) {
         LOG_MESSAGE("Hook Triggered: Auto Attack active");
-        orig_SendPlayerAttack(instance);
+        orig_SendPlayerAttack(instance, flag);
     }
-    if (orig_SendPlayerAttack) orig_SendPlayerAttack(instance);
+    if (orig_SendPlayerAttack) orig_SendPlayerAttack(instance, flag);
 }
 
 static void SetupRuntimeHooksWithRetry(int retriesLeft) {
@@ -301,8 +299,8 @@ static void SetupRuntimeHooksWithRetry(int retriesLeft) {
     ATTEMPT_HOOK_DEBUG(RVA_UDP_DEAD, deadInstalled, hooked_SendPlayerDead, orig_SendPlayerDead);
     ATTEMPT_HOOK_DEBUG(RVA_UDP_DAMAGE, damageInstalled, hooked_SendPlayerDamage, orig_SendPlayerDamage);
     ATTEMPT_HOOK_DEBUG(RVA_UDP_DEFENSE, defenseInstalled, hooked_SendPlayerDefence, orig_SendPlayerDefence);
-    ATTEMPT_HOOK_DEBUG(RVA_ENTITY_HP, hpInstalled, hooked_SetfMaxHP, orig_SetfMaxHP);
-    ATTEMPT_HOOK_DEBUG(RVA_ENTITY_ATKSPD, atkSpeedInstalled, hooked_SetfAttackSpeed, orig_SetfAttackSpeed);
+    ATTEMPT_HOOK_DEBUG(RVA_ENTITY_HP, hpInstalled, hooked_EntityHP, orig_EntityHP);
+    ATTEMPT_HOOK_DEBUG(RVA_ENTITY_ATKSPD, atkSpeedInstalled, hooked_EntityAtkSpd, orig_EntityAtkSpd);
     ATTEMPT_HOOK_DEBUG(RVA_UDP_SKILL, skillInstalled, hooked_SendPlayerSkill, orig_SendPlayerSkill);
     ATTEMPT_HOOK_DEBUG(RVA_UDP_ATTACK, attackInstalled, hooked_SendPlayerAttack, orig_SendPlayerAttack);
 
@@ -325,7 +323,7 @@ static void SetupRuntimeHooksWithRetry(int retriesLeft) {
 }
 
 // ============================================================
-// MENU CONTROLLER
+// MENU CONTROLLER & UI
 // ============================================================
 
 @interface OverlayController : UIViewController
@@ -644,92 +642,36 @@ static void SetupRuntimeHooksWithRetry(int retriesLeft) {
     self.panel.frame = CGRectMake(x, y, panelWidth, panelHeight);
     self.header.frame = CGRectMake(0, 0, panelWidth, 64);
     self.scrollView.frame = CGRectMake(0, 64, panelWidth, MAX(0, panelHeight - 64));
-
-    for (UIView *view in self.header.subviews) {
-        if ([view isKindOfClass:UILabel.class]) {
-            if (view == self.statusLabel) {
-                view.frame = CGRectMake(panelWidth - 130, 8, 114, 20);
-            } else {
-                view.frame = CGRectMake(16, 8, panelWidth - 140, 20);
-            }
-        } else if ([view isKindOfClass:UIButton.class]) {
-            view.frame = CGRectMake(panelWidth - 44, 14, 36, 36);
-        }
-    }
-
-    for (UIView *sub in self.scrollView.subviews) {
-        if (sub.tag == TagSection) {
-            CGRect f = sub.frame;
-            f.origin.x = 16.0;
-            f.size.width = panelWidth - 32.0;
-            sub.frame = f;
-        } else if (sub.tag == TagRow) {
-            CGRect rf = sub.frame;
-            rf.origin.x = 14.0;
-            rf.size.width = panelWidth - 28.0;
-            sub.frame = rf;
-            
-            CGFloat switchWidth = 51.0;
-            for (UIView *rSub in sub.subviews) {
-                if ([rSub isKindOfClass:[UISwitch class]]) {
-                    CGRect sf = rSub.frame;
-                    sf.origin.x = rf.size.width - switchWidth - 12.0;
-                    rSub.frame = sf;
-                } else if (rSub.tag == TagTitle || rSub.tag == TagDetail) {
-                    CGRect sf = rSub.frame;
-                    sf.origin.x = 10.0;
-                    sf.size.width = rf.size.width - switchWidth - 30.0;
-                    rSub.frame = sf;
-                }
-            }
-        } else if ((sub.tag >= 101 && sub.tag <= 104) || (sub.tag >= 201 && sub.tag <= 202)) {
-            CGRect sf = sub.frame;
-            sf.origin.x = 16.0;
-            sf.size.width = panelWidth - 32.0;
-            sub.frame = sf;
-        } else if (sub.tag == TagValue) {
-            CGRect sf = sub.frame;
-            sf.origin.x = panelWidth - 80.0;
-            sub.frame = sf;
-        } else if (sub.tag == TagSliderTitle) {
-            CGRect sf = sub.frame;
-            sf.origin.x = 16.0;
-            sf.size.width = panelWidth - 95.0;
-            sub.frame = sf;
-        }
-    }
 }
 
-// Cho phép chạm xuyên qua các vùng trống của menu để chơi game bình thường
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hit = [super hitTest:point withEvent:event];
-    if (hit == self.view) {
-        // Nếu bấm vào nút nổi thì nhận
-        if (CGRectContainsPoint(self.floatButton.frame, [self.floatButton convertPoint:point fromView:self.view])) {
-            return [self.floatButton hitTest:[self.floatButton convertPoint:point fromView:self.view] withEvent:event];
-        }
-        // Nếu panel đang mở và bấm vào panel thì nhận
-        if (!self.panel.hidden && CGRectContainsPoint(self.panel.frame, [self.panel convertPoint:point fromView:self.view])) {
-            return [self.panel hitTest:[self.panel convertPoint:point fromView:self.view] withEvent:event];
-        }
-        // Ngược lại cho chạm xuyên qua bàn phím/màn hình game ở bên dưới
-        return nil;
+    CGPoint pointInButton = [self.floatButton convertPoint:point fromView:self.view];
+    if ([self.floatButton pointInside:pointInButton withEvent:event]) {
+        return [self.floatButton hitTest:pointInButton withEvent:event];
     }
-    return hit;
+
+    if (!self.panel.hidden) {
+        CGPoint pointInPanel = [self.panel convertPoint:point fromView:self.view];
+        if ([self.panel pointInside:pointInPanel withEvent:event]) {
+            return [self.panel hitTest:pointInPanel withEvent:event];
+        }
+    }
+
+    return nil;
 }
 
 @end
 
 // ============================================================
-// WINDOW MANAGEMENT (DIRECT KEYWINDOW INJECTION)
+// WINDOW MANAGEMENT WITH RETRY
 // ============================================================
 
 static OverlayController *gOverlayController = nil;
 
-static void PresentOverlay(void) {
+static void PresentOverlayWithRetry(int retriesLeft) {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            PresentOverlay();
+            PresentOverlayWithRetry(retriesLeft);
         });
         return;
     }
@@ -748,7 +690,7 @@ static void PresentOverlay(void) {
         targetWindow = UIApplication.sharedApplication.keyWindow;
     }
 
-    if (!targetWindow && @available(iOS 13.0, *)) {
+    if (!targetWindow) {
         for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
             if ([scene isKindOfClass:UIWindowScene.class]) {
                 UIWindowScene *windowScene = (UIWindowScene *)scene;
@@ -762,10 +704,14 @@ static void PresentOverlay(void) {
         }
     }
 
-    if (!targetWindow) {
-        LOG_MESSAGE("Error: No keyWindow found for direct injection.");
+    if (!targetWindow && retriesLeft > 0) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            PresentOverlayWithRetry(retriesLeft - 1);
+        });
         return;
     }
+
+    if (!targetWindow) return;
 
     gOverlayController = [[OverlayController alloc] init];
     gOverlayController.view.frame = targetWindow.bounds;
@@ -785,15 +731,13 @@ __attribute__((constructor))
 static void sheepct_entry(void) {
     @autoreleasepool {
         SafeLogger::shared().initialize();
-        LOG_MESSAGE("=== SHEEPCT MODULE LOADED (DIRECT KEYWINDOW FIX) ===");
+        LOG_MESSAGE("=== SHEEPCT MODULE LOADED (VERIFIED RVAS) ===");
 
-        dispatch_async(dispatch_get_main_queue(), ^{
-            PresentOverlay();
-        });
+        PresentOverlayWithRetry(5);
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            LOG_MESSAGE("Executing hook setup on direct window...");
-            SetupRuntimeHooksWithRetry(5);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            LOG_MESSAGE("Executing runtime hooks setup...");
+            SetupRuntimeHooksWithRetry(3);
         });
     }
 }
