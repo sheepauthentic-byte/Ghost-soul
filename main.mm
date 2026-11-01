@@ -1161,22 +1161,23 @@ static void PresentOverlay(void) {
 }
 
 // ============================================================
-// ENTRY POINT
+// ENTRY POINT (INSTANT SYNC MOUNT)
 // ============================================================
 
 __attribute__((constructor))
 static void sheepct_entry(void) {
     @autoreleasepool {
         SafeLogger::shared().initialize();
+        LOG_MESSAGE("Single-file Objective-C++ module loaded with instant mount.");
 
-        LOG_MESSAGE("Single-file Objective-C++ module loaded with direct fallback overlay.");
-
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            SetupRuntimeHooksWithRetry(3);
-        });
-
+        // Ép chạy trực tiếp trên Main Queue ngay lập tức không delay
         dispatch_async(dispatch_get_main_queue(), ^{
             PresentOverlay();
+        });
+
+        // Kích hoạt hook ngầm sau 2 giây khi game đã ổn định ngữ cảnh bộ nhớ
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            SetupRuntimeHooksWithRetry(3);
         });
     }
 }
