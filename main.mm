@@ -1111,10 +1111,10 @@ static void SetupRuntimeHooksWithRetry(int retriesLeft) {
 @end
 
 // ============================================================
-// WINDOW MANAGEMENT (DIRECT FALLBACK)
+// WINDOW MANAGEMENT (DIRECT KEYWINDOW INJECTION)
 // ============================================================
 
-static PassThroughWindow *gOverlayWindow = nil;
+static OverlayController *gOverlayController = nil;
 
 static void PresentOverlay(void) {
     if (![NSThread isMainThread]) {
@@ -1124,42 +1124,51 @@ static void PresentOverlay(void) {
         return;
     }
 
-    if (gOverlayWindow)
+    if (gOverlayController)
         return;
 
-    UIWindowScene *activeScene = nil;
-
-    @try {
-        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-            if ([scene isKindOfClass:UIWindowScene.class] &&
-                scene.activationState ==
-                    UISceneActivationStateForegroundActive) {
-                activeScene = (UIWindowScene *)scene;
-                break;
-            }
+    // Tìm cửa sổ chính đang hoạt động của game
+    UIWindow *targetWindow = nil;
+    for (UIWindow *window in UIApplication.sharedApplication.windows) {
+        if (window.isKeyWindow) {
+            targetWindow = window;
+            break;
         }
-    } @catch (__unused NSException *e) {}
-
-    if (activeScene) {
-        gOverlayWindow =
-            [[PassThroughWindow alloc]
-                initWithWindowScene:activeScene];
-        gOverlayWindow.frame = activeScene.coordinateSpace.bounds;
-    } else {
-        gOverlayWindow =
-            [[PassThroughWindow alloc]
-                initWithFrame:UIScreen.mainScreen.bounds];
     }
 
-    gOverlayWindow.backgroundColor = UIColor.clearColor;
-    gOverlayWindow.windowLevel = UIWindowLevelAlert + 999;
-    gOverlayWindow.rootViewController =
-        [[OverlayController alloc] init];
-    gOverlayWindow.hidden = NO;
+    if (!targetWindow) {
+        targetWindow = UIApplication.sharedApplication.keyWindow;
+    }
 
-    LOG_MESSAGE("Overlay initialized via direct fallback window.");
+    if (!targetWindow && @available(iOS 13.0, *)) {
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if ([scene isKindOfClass:UIWindowScene.class]) {
+                UIWindowScene *windowScene = (UIWindowScene *)scene;
+                for (UIWindow *window in windowScene.windows) {
+                    if (window.isKeyWindow) {
+                        targetWindow = window;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!targetWindow) {
+        LOG_MESSAGE("Error: No keyWindow found for injection.");
+        return;
+    }
+
+    gOverlayController = [[OverlayController alloc] init];
+    gOverlayController.view.frame = targetWindow.bounds;
+    gOverlayController.view.backgroundColor = UIColor.clearColor;
+
+    // Trực tiếp nhúng thẳng view của menu vào cửa sổ chính của game
+    [targetWindow addSubview:gOverlayController.view];
+    [targetWindow bringSubviewToFront:gOverlayController.view];
+
+    LOG_MESSAGE("Overlay successfully injected directly into game keyWindow.");
 }
-
 // ============================================================
 // ENTRY POINT (INSTANT SYNC MOUNT)
 // ============================================================
