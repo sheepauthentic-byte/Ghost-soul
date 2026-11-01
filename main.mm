@@ -1,316 +1,1070 @@
+// Language: Objective-C++ (C++17)
+// Target: iOS non-jailbroken Mach-O (Unity/IL2CPP dynamic library)
+// Compiler: clang++ (Makefile/GitHub Actions workflow compliant)
+
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+
 #include <string>
 #include <fstream>
 #include <mutex>
-#include <dlfcn.h>
-#include <mach-o/dyld.h>
-#include <mach/mach.h>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <algorithm>
+#include <limits>
 
-enum {
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach-o/getsect.h>
+#include <dlfcn.h>
+
+extern "C" {
+    int DobbyHook(void *address, void *replace, void **backup);
+    int DobbyDestroy(void *address);
+}
+
+// ============================================================
+// CONFIGURATION & GAME HOOK RVAS
+// ============================================================
+
+static NSString * const kLogFileName = @"sheepct.log";
+
+// Verified Game RVAs (GhostSoulM / UnityFramework)
+#define RVA_ENTITY_SPEED      0x19ce918 // void EntityAIPlayer::SetfSpeed(void* instance, float speed)
+#define RVA_UDP_DEAD          0x1748fbc // void UdpClient::SendPlayerDead_C(void* instance)
+#define RVA_UDP_DAMAGE        0x1744888 // void UdpClient::SendPlayerDamage_C(void* instance, float damage)
+#define RVA_UDP_DEFENSE       0x1747348 // void UdpClient::SendPlayerDefence_C(void* instance, float defense)
+#define RVA_ENTITY_HP         0x19cf020 // void EntityAIPlayer::SetfMaxHP(void* instance, float hp)
+#define RVA_ENTITY_ATKSPD     0x19cf410 // void EntityAIPlayer::SetfAttackSpeed(void* instance, float atkSpd)
+#define RVA_UDP_SKILL         0x1743c2c // void UdpClient::SendPlayerSkill_C(void* instance)
+#define RVA_UDP_ATTACK        0x1747508 // void UdpClient::SendPlayerAttack(void* instance)
+
+enum : NSInteger {
     TagSection = 700,
     TagRow = 701,
     TagTitle = 702,
     TagDetail = 703,
-    TagValue = 888,
-    TagSlider = 704
+    TagSliderTitle = 705,
+    TagValue = 888
 };
 
-struct AllModState {
-    bool autoSkill = false;
-    bool instantSkill = false;
-    bool autoAttack = false;
-    bool oneHitKill = false;
+// ============================================================
+// THREAD-SAFE LOGGER
+// ============================================================
+
+class SafeLogger {
+private:
+    std::mutex mutex_;
+    std::ofstream stream_;
+
+    SafeLogger() = default;
+
+public:
+    SafeLogger(const SafeLogger &) = delete;
+    SafeLogger &operator=(const SafeLogger &) = delete;
+
+    static SafeLogger &shared() {
+        static SafeLogger instance;
+        return instance;
+    }
+
+    void initialize() {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        if (stream_.is_open())
+            return;
+
+        @autoreleasepool {
+            NSArray *paths =
+                NSSearchPathForDirectoriesInDomains(
+                    NSDocumentDirectory,
+                    NSUserDomainMask,
+                    YES
+                );
+
+            if (paths.count == 0)
+                return;
+
+            NSString *path =
+                [paths.firstObject stringByAppendingPathComponent:kLogFileName];
+
+            const char *filePath = path.fileSystemRepresentation;
+
+            if (!filePath)
+                return;
+
+            stream_.open(filePath, std::ios::out | std::ios::app);
+        }
+    }
+
+    void write(const std::string &message) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        if (!stream_.is_open())
+            return;
+
+        @autoreleasepool {
+            NSDateFormatter *formatter =
+                [[NSDateFormatter alloc] init];
+
+            formatter.locale =
+                [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+
+            formatter.dateFormat = @"yyyy-MM-dd HH:mm:ss.SSS";
+
+            NSString *date =
+                [formatter stringFromDate:[NSDate date]];
+
+            const char *dateString = date.UTF8String;
+
+            stream_
+                << "["
+                << (dateString ? dateString : "unknown")
+                << "] "
+                << message
+                << '\n';
+
+            stream_.flush();
+        }
+    }
+
+    ~SafeLogger() {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        if (stream_.is_open())
+            stream_.close();
+    }
+};
+
+#define LOG_MESSAGE(x) SafeLogger::shared().write(x)
+
+// ============================================================
+// THREAD-SAFE SETTINGS & MOD STATE
+// ============================================================
+
+struct MenuSettings {
+    bool showFPS = false;
+    bool compactMode = false;
+    bool showDiagnostics = true;
+
+    // Feature Toggles
     bool godMode = false;
+    bool autoSkill = false;
+    bool autoAttack = false;
     bool defenseBoost = false;
-    bool critMultiplier = false;
-    bool mapHack = false;
+
+    // Numerical Multipliers
     float speedMultiplier = 1.0f;
     float damageMultiplier = 1.0f;
     float hpMultiplier = 1.0f;
     float attackSpeedMultiplier = 1.0f;
+
+    float scale = 1.0f;
+    float opacity = 0.95f;
 };
 
-static AllModState g_AllState;
-static std::ofstream g_LogStream;
-static std::mutex g_LogMutex;
-static std::mutex g_StateMutex;
-static uintptr_t g_UnityFrameworkBase = 0;
+struct HookState {
+    bool speedInstalled = false;
+    bool deadInstalled = false;
+    bool damageInstalled = false;
+    bool defenseInstalled = false;
+    bool hpInstalled = false;
+    bool atkSpeedInstalled = false;
+    bool skillInstalled = false;
+    bool attackInstalled = false;
+};
 
-#define RVA_UDP_SKILL      0x1743c2c // UdpClient::SendPlayerSkill_C
-#define RVA_UDP_SPEED      0x1743d48 // UdpClient::SendPlayerSpeed_C
-#define RVA_UDP_DAMAGE     0x1744888 // UdpClient::SendPlayerDamage_C
-#define RVA_UDP_DEFENSE    0x1747348 // UdpClient::SendPlayerDefence_C
-#define RVA_UDP_ATTACK     0x1747508 // UdpClient::SendPlayerAttack_C
-#define RVA_UDP_DEAD       0x1748fbc // UdpClient::SendPlayerDead_C
-#define RVA_ENTITY_SPEED   0x19ce918 // EntityAIPlayer::SetfSpeed
-#define RVA_TCP_ATTACK     0x407d87c // TcpGame::SendPlayerAttack
-#define RVA_TCP_MOVE       0x4089150 // TcpGame::SendPlayerMove_C
+static HookState g_HookStatus;
 
-void InitAllLogger() {
-    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    if ([paths count] > 0) {
-        NSString *path = [[paths objectAtIndex:0] stringByAppendingPathComponent:@"sheepct_all_features.log"];
-        const char *cPath = [path UTF8String];
-        if (cPath) {
-            std::lock_guard<std::mutex> lock(g_LogMutex);
-            g_LogStream.open(cPath, std::ios::out | std::ios::app);
-        }
+class SettingsStore {
+private:
+    std::mutex mutex_;
+    MenuSettings settings_;
+
+public:
+    static SettingsStore &shared() {
+        static SettingsStore instance;
+        return instance;
     }
-}
 
-void LogAllMessage(const std::string& msg) {
-    std::lock_guard<std::mutex> lock(g_LogMutex);
-    if (g_LogStream.is_open()) {
-        NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-        [fmt setDateFormat:@"yyyy-MM-dd HH:mm:ss.SSS"];
-        NSString *dt = [fmt stringFromDate:[NSDate date]];
-        const char *dtStr = [dt UTF8String];
-        if (dtStr) {
-            g_LogStream << "[" << dtStr << "] " << msg << std::endl;
-            g_LogStream.flush();
-        }
+    MenuSettings snapshot() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return settings_;
     }
-}
 
-uintptr_t ResolveUnityFrameworkBase() {
-    if (g_UnityFrameworkBase != 0) return g_UnityFrameworkBase;
+    void update(const MenuSettings &value) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        settings_ = value;
+    }
+
+    template<typename Callback>
+    void modify(Callback callback) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        callback(settings_);
+    }
+};
+
+// ============================================================
+// SAFE MACH-O INSPECTION & HOOK RESOLUTION
+// ============================================================
+
+static uintptr_t GetVerifiedTargetAddress(uintptr_t rva) {
     uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
+    for (uint32_t i = 0; i < count; ++i) {
         const char *name = _dyld_get_image_name(i);
         if (name && (strstr(name, "UnityFramework") || strstr(name, "GhostSoulM"))) {
-            g_UnityFrameworkBase = (uintptr_t)_dyld_get_image_header(i);
-            break;
+            const mach_header *rawHeader = _dyld_get_image_header(i);
+            if (rawHeader && rawHeader->magic == MH_MAGIC_64) {
+                const auto *header = reinterpret_cast<const mach_header_64 *>(rawHeader);
+                uintptr_t slide = _dyld_get_image_vmaddr_slide(i);
+                
+                unsigned long size = 0;
+                uint8_t *section = getsectiondata(header, "__TEXT", "__text", &size);
+                if (section && size > 0) {
+                    uintptr_t candidate = (uintptr_t)header + slide + rva;
+                    uintptr_t sectStart = (uintptr_t)section + slide;
+                    uintptr_t sectEnd = sectStart + size;
+                    
+                    if (candidate >= sectStart && candidate < sectEnd) {
+                        return candidate;
+                    }
+                }
+            }
         }
     }
-    return g_UnityFrameworkBase;
+    return 0;
 }
 
-template <typename T, typename... Args>
-T CallGameFunction(uintptr_t rva, Args... args) {
-    uintptr_t base = ResolveUnityFrameworkBase();
-    if (base == 0) return T();
-    uintptr_t targetAddr = base + rva;
-    
-    Dl_info info;
-    if (dladdr((void*)targetAddr, &info) == 0) return T();
+// Function Pointers for Original Game Methods
+typedef void (*OriginalSetfSpeed)(void *instance, float speed);
+typedef void (*OriginalSendPlayerDead)(void *instance);
+typedef void (*OriginalSendPlayerDamage)(void *instance, float damage);
+typedef void (*OriginalSendPlayerDefence)(void *instance, float defense);
+typedef void (*OriginalSetfMaxHP)(void *instance, float hp);
+typedef void (*OriginalSetfAttackSpeed)(void *instance, float atkSpd);
+typedef void (*OriginalSendPlayerSkill)(void *instance);
+typedef void (*OriginalSendPlayerAttack)(void *instance);
 
-    T (*func)(Args...) = (T (*)(Args...))targetAddr;
-    return func(args...);
+static OriginalSetfSpeed orig_SetfSpeed = nullptr;
+static OriginalSendPlayerDead orig_SendPlayerDead = nullptr;
+static OriginalSendPlayerDamage orig_SendPlayerDamage = nullptr;
+static OriginalSendPlayerDefence orig_SendPlayerDefence = nullptr;
+static OriginalSetfMaxHP orig_SetfMaxHP = nullptr;
+static OriginalSetfAttackSpeed orig_SetfAttackSpeed = nullptr;
+static OriginalSendPlayerSkill orig_SendPlayerSkill = nullptr;
+static OriginalSendPlayerAttack orig_SendPlayerAttack = nullptr;
+
+// Live Hook Replacements
+void hooked_SetfSpeed(void *instance, float speed) {
+    if (instance != nullptr) {
+        MenuSettings s = SettingsStore::shared().snapshot();
+        speed *= s.speedMultiplier;
+    }
+    if (orig_SetfSpeed) orig_SetfSpeed(instance, speed);
 }
+
+void hooked_SendPlayerDead(void *instance) {
+    MenuSettings s = SettingsStore::shared().snapshot();
+    if (s.godMode && instance != nullptr) {
+        return; // Suppress death call transmission
+    }
+    if (orig_SendPlayerDead) orig_SendPlayerDead(instance);
+}
+
+void hooked_SendPlayerDamage(void *instance, float damage) {
+    if (instance != nullptr) {
+        MenuSettings s = SettingsStore::shared().snapshot();
+        damage *= s.damageMultiplier;
+    }
+    if (orig_SendPlayerDamage) orig_SendPlayerDamage(instance, damage);
+}
+
+void hooked_SendPlayerDefence(void *instance, float defense) {
+    if (instance != nullptr) {
+        MenuSettings s = SettingsStore::shared().snapshot();
+        if (s.defenseBoost) {
+            defense *= 5.0f;
+        }
+    }
+    if (orig_SendPlayerDefence) orig_SendPlayerDefence(instance, defense);
+}
+
+void hooked_SetfMaxHP(void *instance, float hp) {
+    if (instance != nullptr) {
+        MenuSettings s = SettingsStore::shared().snapshot();
+        hp *= s.hpMultiplier;
+    }
+    if (orig_SetfMaxHP) orig_SetfMaxHP(instance, hp);
+}
+
+void hooked_SetfAttackSpeed(void *instance, float atkSpd) {
+    if (instance != nullptr) {
+        MenuSettings s = SettingsStore::shared().snapshot();
+        atkSpd *= s.attackSpeedMultiplier;
+    }
+    if (orig_SetfAttackSpeed) orig_SetfAttackSpeed(instance, atkSpd);
+}
+
+void hooked_SendPlayerSkill(void *instance) {
+    MenuSettings s = SettingsStore::shared().snapshot();
+    if (s.autoSkill && instance != nullptr && orig_SendPlayerSkill) {
+        orig_SendPlayerSkill(instance); // Secondary pulse execution
+    }
+    if (orig_SendPlayerSkill) orig_SendPlayerSkill(instance);
+}
+
+void hooked_SendPlayerAttack(void *instance) {
+    MenuSettings s = SettingsStore::shared().snapshot();
+    if (s.autoAttack && instance != nullptr && orig_SendPlayerAttack) {
+        orig_SendPlayerAttack(instance); // Double-stream execution
+    }
+    if (orig_SendPlayerAttack) orig_SendPlayerAttack(instance);
+}
+
+static void SetupRuntimeHooksWithRetry(int retriesLeft) {
+    if (!g_HookStatus.speedInstalled) {
+        uintptr_t addr = GetVerifiedTargetAddress(RVA_ENTITY_SPEED);
+        if (addr != 0 && DobbyHook((void*)addr, (void*)hooked_SetfSpeed, (void**)&orig_SetfSpeed) == 0) {
+            g_HookStatus.speedInstalled = true;
+            LOG_MESSAGE("Success: Hooked EntityAIPlayer::SetfSpeed");
+        }
+    }
+
+    if (!g_HookStatus.deadInstalled) {
+        uintptr_t addr = GetVerifiedTargetAddress(RVA_UDP_DEAD);
+        if (addr != 0 && DobbyHook((void*)addr, (void*)hooked_SendPlayerDead, (void**)&orig_SendPlayerDead) == 0) {
+            g_HookStatus.deadInstalled = true;
+            LOG_MESSAGE("Success: Hooked UdpClient::SendPlayerDead_C");
+        }
+    }
+
+    if (!g_HookStatus.damageInstalled) {
+        uintptr_t addr = GetVerifiedTargetAddress(RVA_UDP_DAMAGE);
+        if (addr != 0 && DobbyHook((void*)addr, (void*)hooked_SendPlayerDamage, (void**)&orig_SendPlayerDamage) == 0) {
+            g_HookStatus.damageInstalled = true;
+            LOG_MESSAGE("Success: Hooked UdpClient::SendPlayerDamage_C");
+        }
+    }
+
+    if (!g_HookStatus.defenseInstalled) {
+        uintptr_t addr = GetVerifiedTargetAddress(RVA_UDP_DEFENSE);
+        if (addr != 0 && DobbyHook((void*)addr, (void*)hooked_SendPlayerDefence, (void**)&orig_SendPlayerDefence) == 0) {
+            g_HookStatus.defenseInstalled = true;
+            LOG_MESSAGE("Success: Hooked UdpClient::SendPlayerDefence_C");
+        }
+    }
+
+    if (!g_HookStatus.hpInstalled) {
+        uintptr_t addr = GetVerifiedTargetAddress(RVA_ENTITY_HP);
+        if (addr != 0 && DobbyHook((void*)addr, (void*)hooked_SetfMaxHP, (void**)&orig_SetfMaxHP) == 0) {
+            g_HookStatus.hpInstalled = true;
+            LOG_MESSAGE("Success: Hooked EntityAIPlayer::SetfMaxHP");
+        }
+    }
+
+    if (!g_HookStatus.atkSpeedInstalled) {
+        uintptr_t addr = GetVerifiedTargetAddress(RVA_ENTITY_ATKSPD);
+        if (addr != 0 && DobbyHook((void*)addr, (void*)hooked_SetfAttackSpeed, (void**)&orig_SetfAttackSpeed) == 0) {
+            g_HookStatus.atkSpeedInstalled = true;
+            LOG_MESSAGE("Success: Hooked EntityAIPlayer::SetfAttackSpeed");
+        }
+    }
+
+    if (!g_HookStatus.skillInstalled) {
+        uintptr_t addr = GetVerifiedTargetAddress(RVA_UDP_SKILL);
+        if (addr != 0 && DobbyHook((void*)addr, (void*)hooked_SendPlayerSkill, (void**)&orig_SendPlayerSkill) == 0) {
+            g_HookStatus.skillInstalled = true;
+            LOG_MESSAGE("Success: Hooked UdpClient::SendPlayerSkill_C");
+        }
+    }
+
+    if (!g_HookStatus.attackInstalled) {
+        uintptr_t addr = GetVerifiedTargetAddress(RVA_UDP_ATTACK);
+        if (addr != 0 && DobbyHook((void*)addr, (void*)hooked_SendPlayerAttack, (void**)&orig_SendPlayerAttack) == 0) {
+            g_HookStatus.attackInstalled = true;
+            LOG_MESSAGE("Success: Hooked UdpClient::SendPlayerAttack");
+        }
+    }
+
+    int activeCount = (g_HookStatus.speedInstalled ? 1 : 0) +
+                      (g_HookStatus.deadInstalled ? 1 : 0) +
+                      (g_HookStatus.damageInstalled ? 1 : 0) +
+                      (g_HookStatus.defenseInstalled ? 1 : 0) +
+                      (g_HookStatus.hpInstalled ? 1 : 0) +
+                      (g_HookStatus.atkSpeedInstalled ? 1 : 0) +
+                      (g_HookStatus.skillInstalled ? 1 : 0) +
+                      (g_HookStatus.attackInstalled ? 1 : 0);
+
+    if (activeCount < 8 && retriesLeft > 0) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            SetupRuntimeHooksWithRetry(retriesLeft - 1);
+        });
+    }
+}
+
+// ============================================================
+// OVERLAY WINDOW
+// ============================================================
 
 @interface PassThroughWindow : UIWindow
 @end
 
 @implementation PassThroughWindow
+
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
-    if (hit == self || hit == self.rootViewController.view) {
+
+    if (hit == self || hit == self.rootViewController.view)
         return nil;
-    }
+
     return hit;
 }
+
 @end
 
-@interface AllFeatureMenuController : UIViewController
-@property (nonatomic, strong) UIButton *floatButton;
-@property (nonatomic, strong) UIView *panel;
-@property (nonatomic, strong) UIView *headerView;
-@property (nonatomic, strong) UIScrollView *scrollView;
-@property (nonatomic, strong) UILabel *speedLbl, *dmgLbl, *hpLbl, *atkSpdLbl;
-@property (nonatomic, assign) BOOL isOpen;
-@property (nonatomic, assign) BOOL didDrag;
-@property (nonatomic, assign) CGPoint dragStartCenter;
+// ============================================================
+// MENU CONTROLLER
+// ============================================================
+
+@interface OverlayController : UIViewController
+
+@property(nonatomic,strong) UIButton *floatButton;
+@property(nonatomic,strong) UIView *panel;
+@property(nonatomic,strong) UIView *header;
+@property(nonatomic,strong) UIScrollView *scrollView;
+
+@property(nonatomic,strong) UILabel *statusLabel;
+@property(nonatomic,strong) UILabel *scaleLabel;
+@property(nonatomic,strong) UILabel *opacityLabel;
+@property(nonatomic,strong) UILabel *speedLabel;
+@property(nonatomic,strong) UILabel *damageLabel;
+@property(nonatomic,strong) UILabel *hpLabel;
+@property(nonatomic,strong) UILabel *atkSpeedLabel;
+
+@property(nonatomic,strong) NSTimer *statusTimer;
+
+@property(nonatomic,assign) BOOL isOpen;
+@property(nonatomic,assign) BOOL didDrag;
+@property(nonatomic,assign) CGPoint dragStartTouchPoint;
+
 @end
 
-@implementation AllFeatureMenuController
+@implementation OverlayController
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+
     self.view.backgroundColor = UIColor.clearColor;
-    self.view.userInteractionEnabled = YES;
-    
+
     [self buildPanel];
     [self buildFloatingButton];
+
+    self.statusTimer =
+        [NSTimer scheduledTimerWithTimeInterval:1.0
+                                         target:self
+                                       selector:@selector(refreshStatus)
+                                       userInfo:nil
+                                        repeats:YES];
+
+    [self refreshStatus];
 }
 
+- (void)dealloc {
+    [self.statusTimer invalidate];
+    self.statusTimer = nil;
+}
+
+- (void)refreshStatus {
+    if (!self.statusLabel)
+        return;
+
+    int count = (g_HookStatus.speedInstalled ? 1 : 0) +
+                (g_HookStatus.deadInstalled ? 1 : 0) +
+                (g_HookStatus.damageInstalled ? 1 : 0) +
+                (g_HookStatus.defenseInstalled ? 1 : 0) +
+                (g_HookStatus.hpInstalled ? 1 : 0) +
+                (g_HookStatus.atkSpeedInstalled ? 1 : 0) +
+                (g_HookStatus.skillInstalled ? 1 : 0) +
+                (g_HookStatus.attackInstalled ? 1 : 0);
+
+    self.statusLabel.text =
+        [NSString stringWithFormat:@"Hooks: %d/8", count];
+
+    self.statusLabel.textColor =
+        (count == 8)
+        ? [UIColor colorWithRed:0.42 green:0.85 blue:0.55 alpha:1]
+        : [UIColor colorWithRed:0.95 green:0.65 blue:0.25 alpha:1];
+}
+
+// ------------------------------------------------------------
+// FLOATING BUTTON
+// ------------------------------------------------------------
+
 - (void)buildFloatingButton {
-    self.floatButton = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.floatButton.frame = CGRectMake(18, 120, 58, 58);
-    self.floatButton.backgroundColor = [UIColor colorWithRed:0.15 green:0.40 blue:0.90 alpha:0.96];
-    [self.floatButton setTitle:@"ALL" forState:UIControlStateNormal];
-    [self.floatButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    self.floatButton.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightHeavy];
+    self.floatButton =
+        [UIButton buttonWithType:UIButtonTypeCustom];
+
+    self.floatButton.frame =
+        CGRectMake(18, 130, 58, 58);
+
+    self.floatButton.backgroundColor =
+        [UIColor colorWithRed:0.15
+                        green:0.40
+                         blue:0.90
+                        alpha:0.96];
+
+    [self.floatButton setTitle:@"ALL"
+                      forState:UIControlStateNormal];
+
+    self.floatButton.titleLabel.font =
+        [UIFont systemFontOfSize:15
+                          weight:UIFontWeightHeavy];
+
     self.floatButton.layer.cornerRadius = 29;
     self.floatButton.layer.borderWidth = 2;
-    self.floatButton.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.8].CGColor;
-    self.floatButton.exclusiveTouch = YES;
-    
-    [self.floatButton addTarget:self action:@selector(floatTapped:) forControlEvents:UIControlEventTouchUpInside];
-    [self.floatButton addTarget:self action:@selector(floatTouchDown:) forControlEvents:UIControlEventTouchDown];
-    [self.floatButton addTarget:self action:@selector(floatDragged:withEvent:) forControlEvents:UIControlEventTouchDragInside | UIControlEventTouchDragOutside];
-    [self.floatButton addTarget:self action:@selector(floatTouchEnded:) forControlEvents:UIControlEventTouchUpInside];
-    [self.floatButton addTarget:self action:@selector(floatTouchEnded:) forControlEvents:UIControlEventTouchUpOutside];
-    [self.floatButton addTarget:self action:@selector(floatTouchEnded:) forControlEvents:UIControlEventTouchCancel];
-    
+    self.floatButton.layer.borderColor =
+        UIColor.whiteColor.CGColor;
+
+    [self.floatButton addTarget:self
+                         action:@selector(buttonDown:withEvent:)
+               forControlEvents:UIControlEventTouchDown];
+
+    [self.floatButton addTarget:self
+                         action:@selector(buttonDragged:withEvent:)
+               forControlEvents:
+                   UIControlEventTouchDragInside |
+                   UIControlEventTouchDragOutside];
+
+    [self.floatButton addTarget:self
+                         action:@selector(buttonTapped:)
+               forControlEvents:UIControlEventTouchUpInside];
+
     [self.view addSubview:self.floatButton];
 }
 
-- (void)floatTouchDown:(UIButton *)button {
+- (void)buttonDown:(UIButton *)button
+        withEvent:(UIEvent *)event {
+
     self.didDrag = NO;
-    self.dragStartCenter = button.center;
+
+    UITouch *touch = event.allTouches.anyObject;
+
+    if (touch)
+        self.dragStartTouchPoint = [touch locationInView:self.view];
 }
 
-- (void)floatDragged:(UIButton *)button withEvent:(UIEvent *)event {
+- (void)buttonDragged:(UIButton *)button
+            withEvent:(UIEvent *)event {
+
     UITouch *touch = event.allTouches.anyObject;
-    if (!touch) return;
 
-    CGPoint point = [touch locationInView:self.view];
-    CGPoint start = [touch previousLocationInView:self.view];
+    if (!touch)
+        return;
 
-    if (hypot(point.x - self.dragStartCenter.x, point.y - self.dragStartCenter.y) > 6.0) {
+    CGPoint current = [touch locationInView:self.view];
+
+    CGFloat distance =
+        hypot(
+            current.x - self.dragStartTouchPoint.x,
+            current.y - self.dragStartTouchPoint.y
+        );
+
+    if (distance > 5.0)
         self.didDrag = YES;
-    }
-    if (!self.didDrag) return;
 
-    CGPoint delta = CGPointMake(point.x - start.x, point.y - start.y);
-    CGPoint center = CGPointMake(button.center.x + delta.x, button.center.y + delta.y);
+    if (!self.didDrag)
+        return;
 
-    UIEdgeInsets insets = UIEdgeInsetsZero;
-    if (@available(iOS 11.0, *)) {
-        insets = self.view.safeAreaInsets;
-    }
-    
+    CGPoint previous =
+        [touch previousLocationInView:self.view];
+
+    CGPoint center = button.center;
+
+    center.x += current.x - previous.x;
+    center.y += current.y - previous.y;
+
+    UIEdgeInsets insets = self.view.safeAreaInsets;
+
     CGFloat halfW = CGRectGetWidth(button.bounds) / 2.0;
     CGFloat halfH = CGRectGetHeight(button.bounds) / 2.0;
 
-    center.x = MAX(insets.left + halfW, MIN(CGRectGetWidth(self.view.bounds) - insets.right - halfW, center.x));
-    center.y = MAX(insets.top + halfH, MIN(CGRectGetHeight(self.view.bounds) - insets.bottom - halfH, center.y));
+    CGFloat minX = insets.left + halfW;
+    CGFloat maxX = CGRectGetWidth(self.view.bounds)
+                 - insets.right - halfW;
+
+    CGFloat minY = insets.top + halfH;
+    CGFloat maxY = CGRectGetHeight(self.view.bounds)
+                 - insets.bottom - halfH;
+
+    center.x = MAX(minX, MIN(maxX, center.x));
+    center.y = MAX(minY, MIN(maxY, center.y));
 
     button.center = center;
 }
 
-- (void)floatTouchEnded:(UIButton *)button {
-    if (self.didDrag) {
-        [button removeTarget:self action:@selector(floatTapped:) forControlEvents:UIControlEventTouchUpInside];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [button addTarget:self action:@selector(floatTapped:) forControlEvents:UIControlEventTouchUpInside];
-        });
-    }
+- (void)buttonTapped:(UIButton *)button {
+    if (!self.didDrag)
+        [self toggleMenu];
 }
 
-- (void)floatTapped:(UIButton *)button {
-    if (!self.didDrag) {
-        [self toggleMenu];
-    }
-}
+// ------------------------------------------------------------
+// PANEL
+// ------------------------------------------------------------
 
 - (void)buildPanel {
-    self.panel = [[UIView alloc] initWithFrame:CGRectMake(14, 80, 300, 400)];
-    self.panel.backgroundColor = [UIColor colorWithRed:0.07 green:0.08 blue:0.12 alpha:0.98];
+    self.panel = [[UIView alloc]
+        initWithFrame:CGRectZero];
+
+    self.panel.backgroundColor =
+        [UIColor colorWithRed:0.07
+                        green:0.08
+                         blue:0.12
+                        alpha:0.98];
+
     self.panel.layer.cornerRadius = 18;
     self.panel.layer.borderWidth = 1;
-    self.panel.layer.borderColor = [UIColor colorWithRed:0.35 green:0.45 blue:0.65 alpha:0.9].CGColor;
-    self.panel.hidden = YES;
+    self.panel.layer.borderColor =
+        [UIColor colorWithWhite:1 alpha:0.2].CGColor;
+
     self.panel.clipsToBounds = YES;
+    self.panel.hidden = YES;
+
     [self.view addSubview:self.panel];
 
-    self.headerView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 300, 64)];
-    self.headerView.backgroundColor = [UIColor colorWithRed:0.11 green:0.16 blue:0.25 alpha:1];
-    [self.panel addSubview:self.headerView];
+    self.header = [[UIView alloc]
+        initWithFrame:CGRectZero];
 
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, 240, 22)];
+    self.header.backgroundColor =
+        [UIColor colorWithRed:0.11
+                        green:0.16
+                         blue:0.25
+                        alpha:1];
+
+    [self.panel addSubview:self.header];
+
+    UILabel *title =
+        [[UILabel alloc] initWithFrame:CGRectZero];
+
     title.tag = TagTitle;
-    title.text = @"SHEEPCT  •  ALL FEATURES ENGINE";
+    title.text = @"SHEEPCT • HOOK ENGINE";
     title.textColor = UIColor.whiteColor;
-    title.font = [UIFont systemFontOfSize:14 weight:UIFontWeightBold];
-    [self.headerView addSubview:title];
+    title.font =
+        [UIFont systemFontOfSize:13
+                          weight:UIFontWeightBold];
 
-    UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(16, 32, 240, 18)];
-    sub.tag = TagDetail;
-    sub.text = @"Trần Mạnh Cường - Tagged Layout Engine";
-    sub.textColor = [UIColor colorWithWhite:0.75 alpha:1];
-    sub.font = [UIFont systemFontOfSize:10];
-    [self.headerView addSubview:sub];
+    [self.header addSubview:title];
 
-    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    closeBtn.tag = 999;
-    closeBtn.frame = CGRectMake(300 - 44, 14, 36, 36);
-    closeBtn.backgroundColor = [UIColor colorWithWhite:1 alpha:0.12];
-    closeBtn.layer.cornerRadius = 18;
-    [closeBtn setTitle:@"×" forState:UIControlStateNormal];
-    [closeBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    [closeBtn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
-    [self.headerView addSubview:closeBtn];
+    self.statusLabel =
+        [[UILabel alloc] initWithFrame:CGRectZero];
 
-    self.scrollView = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 64, 300, 400 - 64)];
+    self.statusLabel.textColor =
+        [UIColor colorWithRed:0.42
+                        green:0.85
+                         blue:0.55
+                        alpha:1];
+
+    self.statusLabel.font =
+        [UIFont monospacedDigitSystemFontOfSize:10
+                                         weight:UIFontWeightBold];
+
+    self.statusLabel.textAlignment = NSTextAlignmentRight;
+
+    [self.header addSubview:self.statusLabel];
+
+    UIButton *close =
+        [UIButton buttonWithType:UIButtonTypeSystem];
+
+    [close setTitle:@"×"
+           forState:UIControlStateNormal];
+
+    [close setTitleColor:UIColor.whiteColor
+                forState:UIControlStateNormal];
+
+    close.titleLabel.font =
+        [UIFont systemFontOfSize:25
+                          weight:UIFontWeightRegular];
+
+    [close addTarget:self
+              action:@selector(toggleMenu)
+    forControlEvents:UIControlEventTouchUpInside];
+
+    [self.header addSubview:close];
+
+    self.scrollView =
+        [[UIScrollView alloc] initWithFrame:CGRectZero];
+
+    self.scrollView.alwaysBounceVertical = YES;
+
     [self.panel addSubview:self.scrollView];
 
-    AllModState stateCopy;
-    {
-        std::lock_guard<std::mutex> lock(g_StateMutex);
-        stateCopy = g_AllState;
+    [self buildSettings];
+}
+
+- (void)buildSettings {
+    MenuSettings settings =
+        SettingsStore::shared().snapshot();
+
+    CGFloat y = 14;
+
+    y = [self addSection:@"1. Combat & Defense" y:y];
+
+    y = [self addSwitch:@"Bất tử / God Mode"
+                    key:@"godMode"
+                     on:settings.godMode
+                      y:y];
+
+    y = [self addSwitch:@"Tự động Kỹ năng"
+                    key:@"autoSkill"
+                     on:settings.autoSkill
+                      y:y];
+
+    y = [self addSwitch:@"Tấn công tự động"
+                    key:@"autoAttack"
+                     on:settings.autoAttack
+                      y:y];
+
+    y = [self addSwitch:@"Tăng cường Phòng thủ"
+                    key:@"defense"
+                     on:settings.defenseBoost
+                      y:y];
+
+    y = [self addSection:@"2. Speed & Multipliers" y:y];
+
+    y = [self addSlider:@"Hệ số Tốc độ (Speed)"
+                  value:settings.speedMultiplier
+                    min:1.0
+                   max:10.0
+                      y:y
+                   tag:101
+             reference:&_speedLabel];
+
+    y = [self addSlider:@"Hệ số Sát thương (Damage)"
+                  value:settings.damageMultiplier
+                    min:1.0
+                   max:20.0
+                      y:y
+                   tag:102
+             reference:&_damageLabel];
+
+    y = [self addSlider:@"Hệ số Máu (HP)"
+                  value:settings.hpMultiplier
+                    min:1.0
+                   max:10.0
+                      y:y
+                   tag:103
+             reference:&_hpLabel];
+
+    y = [self addSlider:@"Tốc độ Đánh (Atk Speed)"
+                  value:settings.attackSpeedMultiplier
+                    min:1.0
+                   max:5.0
+                      y:y
+                   tag:104
+             reference:&_atkSpeedLabel];
+
+    y = [self addSection:@"3. UI & Scale" y:y];
+
+    y = [self addSlider:@"Kích thước giao diện"
+                  value:settings.scale
+                    min:0.7
+                   max:1.3
+                      y:y
+                   tag:201
+             reference:&_scaleLabel];
+
+    y = [self addSlider:@"Độ trong suốt"
+                  value:settings.opacity
+                    min:0.3
+                   max:1.0
+                      y:y
+                   tag:202
+             reference:&_opacityLabel];
+
+    self.scrollView.contentSize =
+        CGSizeMake(320, y + 20);
+}
+
+- (CGFloat)addSection:(NSString *)text y:(CGFloat)y {
+    UILabel *label =
+        [[UILabel alloc] initWithFrame:CGRectMake(16, y, 280, 22)];
+
+    label.tag = TagSection;
+    label.text = text;
+    label.textColor =
+        [UIColor colorWithRed:0.4
+                        green:0.7
+                         blue:1
+                        alpha:1];
+
+    label.font =
+        [UIFont systemFontOfSize:12
+                          weight:UIFontWeightBold];
+
+    [self.scrollView addSubview:label];
+
+    return y + 28;
+}
+
+- (CGFloat)addSwitch:(NSString *)title
+                 key:(NSString *)key
+                  on:(BOOL)value
+                   y:(CGFloat)y {
+
+    UIView *row =
+        [[UIView alloc]
+            initWithFrame:CGRectMake(14, y, 292, 48)];
+
+    row.tag = TagRow;
+    row.backgroundColor =
+        [UIColor colorWithWhite:1 alpha:0.05];
+
+    row.layer.cornerRadius = 10;
+
+    [self.scrollView addSubview:row];
+
+    UILabel *label =
+        [[UILabel alloc]
+            initWithFrame:CGRectMake(10, 0, 205, 48)];
+
+    label.tag = TagTitle;
+    label.text = title;
+    label.textColor = UIColor.whiteColor;
+    label.font =
+        [UIFont systemFontOfSize:12
+                          weight:UIFontWeightSemibold];
+
+    [row addSubview:label];
+
+    UISwitch *toggle =
+        [[UISwitch alloc] initWithFrame:CGRectZero];
+
+    toggle.on = value;
+    toggle.accessibilityIdentifier = key;
+
+    [toggle addTarget:self
+               action:@selector(switchChanged:)
+     forControlEvents:UIControlEventValueChanged];
+
+    [row addSubview:toggle];
+
+    return y + 54;
+}
+
+- (CGFloat)addSlider:(NSString *)title
+               value:(float)value
+                 min:(float)minimum
+                 max:(float)maximum
+                   y:(CGFloat)y
+                 tag:(NSInteger)tag
+           reference:(UILabel **)refLabel {
+
+    UILabel *label =
+        [[UILabel alloc]
+            initWithFrame:CGRectMake(16, y, 220, 20)];
+
+    label.tag = TagSliderTitle;
+    label.text = title;
+    label.textColor = UIColor.whiteColor;
+    label.font =
+        [UIFont systemFontOfSize:11
+                          weight:UIFontWeightSemibold];
+
+    [self.scrollView addSubview:label];
+
+    UILabel *valueLabel =
+        [[UILabel alloc]
+            initWithFrame:CGRectMake(240, y, 60, 20)];
+
+    valueLabel.tag = TagValue;
+    valueLabel.text =
+        [NSString stringWithFormat:@"%.1f×", value];
+
+    valueLabel.textAlignment = NSTextAlignmentRight;
+    valueLabel.textColor =
+        [UIColor colorWithRed:0.42 green:0.85 blue:0.55 alpha:1];
+
+    valueLabel.font =
+        [UIFont monospacedDigitSystemFontOfSize:11
+                                         weight:UIFontWeightBold];
+
+    [self.scrollView addSubview:valueLabel];
+
+    if (refLabel)
+        *refLabel = valueLabel;
+
+    UISlider *slider =
+        [[UISlider alloc]
+            initWithFrame:CGRectMake(16, y + 22, 288, 30)];
+
+    slider.minimumValue = minimum;
+    slider.maximumValue = maximum;
+    slider.value = value;
+    slider.tag = tag;
+
+    [slider addTarget:self
+               action:@selector(sliderChanged:)
+     forControlEvents:UIControlEventValueChanged];
+
+    [self.scrollView addSubview:slider];
+
+    return y + 62;
+}
+
+// ------------------------------------------------------------
+// INTERACTION
+// ------------------------------------------------------------
+
+- (void)switchChanged:(UISwitch *)sender {
+    NSString *key = sender.accessibilityIdentifier;
+
+    SettingsStore::shared().modify(
+        [&](MenuSettings &settings) {
+            if ([key isEqualToString:@"godMode"])
+                settings.godMode = sender.on;
+            else if ([key isEqualToString:@"autoSkill"])
+                settings.autoSkill = sender.on;
+            else if ([key isEqualToString:@"autoAttack"])
+                settings.autoAttack = sender.on;
+            else if ([key isEqualToString:@"defense"])
+                settings.defenseBoost = sender.on;
+        }
+    );
+
+    LOG_MESSAGE(
+        std::string("Feature ") +
+        key.UTF8String +
+        (sender.on ? " -> ON" : " -> OFF")
+    );
+}
+
+- (void)sliderChanged:(UISlider *)sender {
+    float value = sender.value;
+    NSInteger tag = sender.tag;
+
+    SettingsStore::shared().modify(
+        [&](MenuSettings &settings) {
+            if (tag == 101)
+                settings.speedMultiplier = value;
+            else if (tag == 102)
+                settings.damageMultiplier = value;
+            else if (tag == 103)
+                settings.hpMultiplier = value;
+            else if (tag == 104)
+                settings.attackSpeedMultiplier = value;
+            else if (tag == 201)
+                settings.scale = value;
+            else if (tag == 202)
+                settings.opacity = value;
+        }
+    );
+
+    UILabel *targetLabel = nil;
+    if (tag == 101) targetLabel = self.speedLabel;
+    else if (tag == 102) targetLabel = self.damageLabel;
+    else if (tag == 103) targetLabel = self.hpLabel;
+    else if (tag == 104) targetLabel = self.atkSpeedLabel;
+    else if (tag == 201) targetLabel = self.scaleLabel;
+    else if (tag == 202) targetLabel = self.opacityLabel;
+
+    if (targetLabel) {
+        if (tag >= 201) {
+            targetLabel.text = [NSString stringWithFormat:@"%.2f", value];
+        } else {
+            targetLabel.text = [NSString stringWithFormat:@"%.1f×", value];
+        }
     }
 
-    CGFloat y = 10;
-    y = [self addSectionHeader:@"1. Kỹ Năng & Tấn Công" y:y];
-    y = [self addSwitchWithTitle:@"Tự động Kỹ năng" detail:@"UdpClient::SendPlayerSkill_C" key:@"autoSkill" y:y on:stateCopy.autoSkill];
-    y = [self addSwitchWithTitle:@"Không Hồi Chiêu" detail:@"Instant Cooldown" key:@"instantSkill" y:y on:stateCopy.instantSkill];
-    y = [self addSwitchWithTitle:@"Tấn công tốc độ cao" detail:@"TcpGame::SendPlayerAttack" key:@"autoAttack" y:y on:stateCopy.autoAttack];
-    y = [self addSwitchWithTitle:@"Một đòn kết liễu" detail:@"One Hit Kill" key:@"oneHit" y:y on:stateCopy.oneHitKill];
+    MenuSettings settings =
+        SettingsStore::shared().snapshot();
 
-    y = [self addSectionHeader:@"2. Phòng Thủ & Sinh Lực" y:y];
-    y = [self addSwitchWithTitle:@"Bất tử / Khóa Máu" detail:@"UdpClient::SendPlayerDead_C" key:@"godMode" y:y on:stateCopy.godMode];
-    y = [self addSwitchWithTitle:@"Tăng cường Phòng thủ" detail:@"UdpClient::SendPlayerDefence_C" key:@"defense" y:y on:stateCopy.defenseBoost];
-    y = [self addSwitchWithTitle:@"Tăng tỷ lệ Chí mạng" detail:@"Crit Rate Boost" key:@"crit" y:y on:stateCopy.critMultiplier];
+    self.panel.alpha = settings.opacity;
 
-    y = [self addSectionHeader:@"3. Tốc Độ & Di Chuyển" y:y];
-    y = [self addSwitchWithTitle:@"Bản đồ mở rộng (Map Hack)" detail:@"TcpGame::SendPlayerMove_C" key:@"mapHack" y:y on:stateCopy.mapHack];
-    
-    y = [self addSliderWithTitle:@"Hệ số Tốc độ (Speed Multiplier)" key:101 min:1.0 max:10.0 val:stateCopy.speedMultiplier y:y labelRef:&_speedLbl];
-    y = [self addSliderWithTitle:@"Hệ số Sát thương (Damage Multiplier)" key:102 min:1.0 max:20.0 val:stateCopy.damageMultiplier y:y labelRef:&_dmgLbl];
-    y = [self addSliderWithTitle:@"Hệ số Máu / HP Multiplier" key:103 min:1.0 max:10.0 val:stateCopy.hpMultiplier y:y labelRef:&_hpLbl];
-    y = [self addSliderWithTitle:@"Hệ số Tốc độ Đánh (Attack Speed)" key:104 min:1.0 max:5.0 val:stateCopy.attackSpeedMultiplier y:y labelRef:&_atkSpdLbl];
-
-    self.scrollView.contentSize = CGSizeMake(300, y + 20);
+    self.panel.transform =
+        CGAffineTransformMakeScale(
+            settings.scale,
+            settings.scale
+        );
 }
+
+- (void)toggleMenu {
+    self.isOpen = !self.isOpen;
+
+    if (self.isOpen) {
+        self.panel.hidden = NO;
+        self.panel.alpha = 1;
+
+        [self.view bringSubviewToFront:self.floatButton];
+    } else {
+        self.panel.hidden = YES;
+    }
+}
+
+// ------------------------------------------------------------
+// RESPONSIVE LAYOUT
+// ------------------------------------------------------------
 
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
-    
-    CGRect safeArea = self.view.bounds;
-    if (@available(iOS 11.0, *)) {
-        safeArea = UIEdgeInsetsInsetRect(self.view.bounds, self.view.safeAreaInsets);
-    }
-    
-    CGFloat maxW = safeArea.size.width;
-    CGFloat maxH = safeArea.size.height;
-    if (maxW <= 0 || maxH <= 0) return;
 
-    CGFloat panelWidth = MIN(350.0, maxW - 28.0);
-    CGFloat maxPanelHeight = maxH - 20.0;
-    CGFloat contentHeight = self.scrollView.contentSize.height;
-    CGFloat panelHeight = MIN(contentHeight + 64.0, maxPanelHeight);
+    CGRect bounds = self.view.bounds;
+    UIEdgeInsets safe = self.view.safeAreaInsets;
 
-    CGFloat panelX = safeArea.origin.x + (maxW - panelWidth) / 2.0;
-    CGFloat panelY = safeArea.origin.y + (maxH - panelHeight) / 2.0;
+    CGFloat width =
+        MAX(1, bounds.size.width - safe.left - safe.right);
 
-    self.panel.frame = CGRectMake(panelX, panelY, panelWidth, panelHeight);
-    
-    self.headerView.frame = CGRectMake(0, 0, panelWidth, 64);
-    for (UIView *hSub in self.headerView.subviews) {
-        if (hSub.tag == 999) {
-            hSub.frame = CGRectMake(panelWidth - 44, 14, 36, 36);
-        } else if (hSub.tag == TagTitle || hSub.tag == TagDetail) {
-            CGRect f = hSub.frame;
-            f.size.width = panelWidth - 60.0;
-            hSub.frame = f;
+    CGFloat height =
+        MAX(1, bounds.size.height - safe.top - safe.bottom);
+
+    CGFloat panelWidth = MIN(350, MAX(1, width - 20));
+    CGFloat panelHeight = MIN(
+        height - 20,
+        self.scrollView.contentSize.height + 64
+    );
+
+    panelHeight = MAX(150, panelHeight);
+
+    CGFloat x =
+        safe.left + (width - panelWidth) / 2;
+
+    CGFloat y =
+        safe.top + (height - panelHeight) / 2;
+
+    self.panel.frame =
+        CGRectMake(x, y, panelWidth, panelHeight);
+
+    self.header.frame =
+        CGRectMake(0, 0, panelWidth, 64);
+
+    self.scrollView.frame =
+        CGRectMake(
+            0,
+            64,
+            panelWidth,
+            MAX(0, panelHeight - 64)
+        );
+
+    for (UIView *view in self.header.subviews) {
+        if ([view isKindOfClass:UILabel.class]) {
+            if (view == self.statusLabel) {
+                view.frame =
+                    CGRectMake(
+                        panelWidth - 130,
+                        8,
+                        114,
+                        20
+                    );
+            } else {
+                view.frame =
+                    CGRectMake(16, 8, panelWidth - 140, 20);
+            }
+        } else if ([view isKindOfClass:UIButton.class]) {
+            view.frame =
+                CGRectMake(panelWidth - 44, 14, 36, 36);
         }
     }
-    
-    self.scrollView.frame = CGRectMake(0, 64, panelWidth, panelHeight - 64);
-    
+
     for (UIView *sub in self.scrollView.subviews) {
         if (sub.tag == TagSection) {
             CGRect f = sub.frame;
@@ -336,7 +1090,7 @@ T CallGameFunction(uintptr_t rva, Args... args) {
                     rSub.frame = sf;
                 }
             }
-        } else if (sub.tag == TagSlider) {
+        } else if ((sub.tag >= 101 && sub.tag <= 104) || (sub.tag >= 201 && sub.tag <= 202)) {
             CGRect sf = sub.frame;
             sf.origin.x = 16.0;
             sf.size.width = panelWidth - 32.0;
@@ -345,7 +1099,7 @@ T CallGameFunction(uintptr_t rva, Args... args) {
             CGRect sf = sub.frame;
             sf.origin.x = panelWidth - 80.0;
             sub.frame = sf;
-        } else if ([sub isKindOfClass:[UILabel class]] && sub.tag != TagSection && sub.tag != TagValue) {
+        } else if (sub.tag == TagSliderTitle) {
             CGRect sf = sub.frame;
             sf.origin.x = 16.0;
             sf.size.width = panelWidth - 95.0;
@@ -354,187 +1108,77 @@ T CallGameFunction(uintptr_t rva, Args... args) {
     }
 }
 
-- (CGFloat)addSectionHeader:(NSString *)title y:(CGFloat)y {
-    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, y, 300 - 32, 20)];
-    lbl.tag = TagSection;
-    lbl.text = title;
-    lbl.textColor = [UIColor colorWithRed:0.40 green:0.70 blue:1.0 alpha:1];
-    lbl.font = [UIFont systemFontOfSize:12 weight:UIFontWeightBold];
-    [self.scrollView addSubview:lbl];
-    return y + 24;
-}
-
-- (CGFloat)addSwitchWithTitle:(NSString *)title detail:(NSString *)detail key:(NSString *)key y:(CGFloat)y on:(BOOL)isOn {
-    UIView *row = [[UIView alloc] initWithFrame:CGRectMake(14, y, 300 - 28, 44)];
-    row.tag = TagRow;
-    row.backgroundColor = [UIColor colorWithWhite:1 alpha:0.04];
-    row.layer.cornerRadius = 10;
-    [self.scrollView addSubview:row];
-
-    UILabel *tLbl = [[UILabel alloc] initWithFrame:CGRectMake(10, 4, 190, 20)];
-    tLbl.tag = TagTitle;
-    tLbl.text = title;
-    tLbl.textColor = UIColor.whiteColor;
-    tLbl.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
-    [row addSubview:tLbl];
-
-    UILabel *dLbl = [[UILabel alloc] initWithFrame:CGRectMake(10, 24, 190, 15)];
-    dLbl.tag = TagDetail;
-    dLbl.text = detail;
-    dLbl.textColor = [UIColor colorWithWhite:0.60 alpha:1];
-    dLbl.font = [UIFont systemFontOfSize:9];
-    [row addSubview:dLbl];
-
-    UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(300 - 28 - 80, 7, 0, 0)];
-    sw.on = isOn;
-    sw.accessibilityIdentifier = key;
-    [sw addTarget:self action:@selector(switchChanged:) forControlEvents:UIControlEventValueChanged];
-    [row addSubview:sw];
-    return y + 50;
-}
-
-- (CGFloat)addSliderWithTitle:(NSString *)title key:(NSInteger)tag min:(float)min max:(float)max val:(float)val y:(CGFloat)y labelRef:(UILabel **)refLabel {
-    UILabel *tLbl = [[UILabel alloc] initWithFrame:CGRectMake(16, y, 300 - 95, 18)];
-    tLbl.text = title;
-    tLbl.textColor = UIColor.whiteColor;
-    tLbl.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
-    [self.scrollView addSubview:tLbl];
-
-    UILabel *vLbl = [[UILabel alloc] initWithFrame:CGRectMake(300 - 80, y, 64, 18)];
-    vLbl.tag = TagValue;
-    vLbl.text = [NSString stringWithFormat:@"%.1f×", val];
-    vLbl.textColor = [UIColor colorWithRed:0.42 green:0.85 blue:0.55 alpha:1];
-    vLbl.textAlignment = NSTextAlignmentRight;
-    vLbl.font = [UIFont monospacedDigitSystemFontOfSize:11 weight:UIFontWeightBold];
-    [self.scrollView addSubview:vLbl];
-    *refLabel = vLbl;
-
-    UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(16, y + 20, 300 - 32, 24)];
-    slider.tag = TagSlider;
-    slider.minimumValue = min;
-    slider.maximumValue = max;
-    slider.value = val;
-    slider.tag = tag;
-    [slider addTarget:self action:@selector(sliderChanged:) forControlEvents:UIControlEventValueChanged];
-    [slider addTarget:self action:@selector(sliderTouchUp:) forControlEvents:UIControlEventTouchUpInside];
-    [slider addTarget:self action:@selector(sliderTouchUp:) forControlEvents:UIControlEventTouchUpOutside];
-    [slider addTarget:self action:@selector(sliderTouchUp:) forControlEvents:UIControlEventTouchCancel];
-    [self.scrollView addSubview:slider];
-    return y + 54;
-}
-
-- (void)toggleMenu {
-    self.isOpen = !self.isOpen;
-    if (self.isOpen) {
-        self.panel.hidden = NO;
-        self.panel.alpha = 0;
-        self.panel.transform = CGAffineTransformMakeScale(0.95, 0.95);
-        [UIView animateWithDuration:0.18 animations:^{
-            self.panel.alpha = 1;
-            self.panel.transform = CGAffineTransformIdentity;
-        }];
-        [self.view bringSubviewToFront:self.floatButton];
-    } else {
-        [UIView animateWithDuration:0.15 animations:^{
-            self.panel.alpha = 0;
-        } completion:^(BOOL finished) {
-            self.panel.hidden = YES;
-            self.panel.alpha = 1;
-            self.panel.transform = CGAffineTransformIdentity;
-        }];
-    }
-}
-
-- (void)switchChanged:(UISwitch *)sender {
-    NSString *key = sender.accessibilityIdentifier;
-    if (!key) return;
-    const char *cKey = [key UTF8String];
-    if (!cKey) return;
-    
-    BOOL st = sender.on;
-    {
-        std::lock_guard<std::mutex> lock(g_StateMutex);
-        if ([key isEqualToString:@"autoSkill"]) g_AllState.autoSkill = st;
-        else if ([key isEqualToString:@"instantSkill"]) g_AllState.instantSkill = st;
-        else if ([key isEqualToString:@"autoAttack"]) g_AllState.autoAttack = st;
-        else if ([key isEqualToString:@"oneHit"]) g_AllState.oneHitKill = st;
-        else if ([key isEqualToString:@"godMode"]) g_AllState.godMode = st;
-        else if ([key isEqualToString:@"defense"]) g_AllState.defenseBoost = st;
-        else if ([key isEqualToString:@"crit"]) g_AllState.critMultiplier = st;
-        else if ([key isEqualToString:@"mapHack"]) g_AllState.mapHack = st;
-    }
-    
-    if ([key isEqualToString:@"godMode"] && st) {
-        CallGameFunction<void>(RVA_UDP_DEAD);
-    } else if ([key isEqualToString:@"autoSkill"] && st) {
-        CallGameFunction<void>(RVA_UDP_SKILL);
-    } else if ([key isEqualToString:@"autoAttack"] && st) {
-        CallGameFunction<void>(RVA_TCP_ATTACK);
-    }
-
-    LogAllMessage("Feature " + std::string(cKey) + " -> " + (st ? "ON" : "OFF"));
-}
-
-- (void)sliderChanged:(UISlider *)sender {
-    float val = sender.value;
-    {
-        std::lock_guard<std::mutex> lock(g_StateMutex);
-        if (sender.tag == 101) g_AllState.speedMultiplier = val;
-        else if (sender.tag == 102) g_AllState.damageMultiplier = val;
-        else if (sender.tag == 103) g_AllState.hpMultiplier = val;
-        else if (sender.tag == 104) g_AllState.attackSpeedMultiplier = val;
-    }
-    
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (sender.tag == 101) self.speedLbl.text = [NSString stringWithFormat:@"%.1f×", val];
-        else if (sender.tag == 102) self.dmgLbl.text = [NSString stringWithFormat:@"%.1f×", val];
-        else if (sender.tag == 103) self.hpLbl.text = [NSString stringWithFormat:@"%.1f×", val];
-        else if (sender.tag == 104) self.atkSpdLbl.text = [NSString stringWithFormat:@"%.1f×", val];
-    });
-}
-
-- (void)sliderTouchUp:(UISlider *)sender {
-    float val = sender.value;
-    if (sender.tag == 101) {
-        CallGameFunction<void, float>(RVA_ENTITY_SPEED, val);
-        LogAllMessage("Speed Multiplier set to: " + std::to_string(val));
-    } else if (sender.tag == 102) {
-        CallGameFunction<void, float>(RVA_UDP_DAMAGE, val);
-        LogAllMessage("Damage Multiplier set to: " + std::to_string(val));
-    } else if (sender.tag == 103) {
-        LogAllMessage("HP Multiplier set to: " + std::to_string(val));
-    } else if (sender.tag == 104) {
-        LogAllMessage("Attack Speed Multiplier set to: " + std::to_string(val));
-    }
-}
-
 @end
 
-static PassThroughWindow *g_AllWindow = nil;
+// ============================================================
+// WINDOW MANAGEMENT
+// ============================================================
+
+static PassThroughWindow *gOverlayWindow = nil;
+
+static void PresentOverlay(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            PresentOverlay();
+        });
+        return;
+    }
+
+    if (gOverlayWindow)
+        return;
+
+    UIWindowScene *activeScene = nil;
+
+    for (UIScene *scene
+         in UIApplication.sharedApplication.connectedScenes) {
+
+        if ([scene isKindOfClass:UIWindowScene.class] &&
+            scene.activationState ==
+                UISceneActivationStateForegroundActive) {
+
+            activeScene = (UIWindowScene *)scene;
+            break;
+        }
+    }
+
+    if (!activeScene) {
+        LOG_MESSAGE("No active UIWindowScene; overlay postponed.");
+        return;
+    }
+
+    gOverlayWindow =
+        [[PassThroughWindow alloc]
+            initWithWindowScene:activeScene];
+
+    gOverlayWindow.frame = activeScene.coordinateSpace.bounds;
+    gOverlayWindow.backgroundColor = UIColor.clearColor;
+    gOverlayWindow.windowLevel = UIWindowLevelAlert + 999;
+
+    gOverlayWindow.rootViewController =
+        [[OverlayController alloc] init];
+
+    gOverlayWindow.hidden = NO;
+
+    LOG_MESSAGE("Overlay initialized with full hook engine.");
+}
+
+// ============================================================
+// ENTRY POINT
+// ============================================================
 
 __attribute__((constructor))
-static void sheepct_all_entry(void) {
-    InitAllLogger();
-    LogAllMessage("Sheepct Tagged Layout Engine loaded.");
+static void sheepct_entry(void) {
+    @autoreleasepool {
+        SafeLogger::shared().initialize();
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (g_AllWindow) return;
-        UIWindowScene *windowScene = nil;
-        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-            if ([scene isKindOfClass:[UIWindowScene class]] && scene.activationState == UISceneActivationStateForegroundActive) {
-                windowScene = (UIWindowScene *)scene;
-                break;
-            }
-        }
-        if (windowScene) {
-            g_AllWindow = [[PassThroughWindow alloc] initWithWindowScene:windowScene];
-        } else {
-            g_AllWindow = [[PassThroughWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
-        }
-        g_AllWindow.windowLevel = UIWindowLevelAlert + 999;
-        g_AllWindow.backgroundColor = UIColor.clearColor;
-        g_AllWindow.rootViewController = [[AllFeatureMenuController alloc] init];
-        g_AllWindow.userInteractionEnabled = YES;
-        g_AllWindow.hidden = NO;
-    });
+        LOG_MESSAGE("Single-file Objective-C++ module loaded with live hooks.");
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            SetupRuntimeHooksWithRetry(3);
+        });
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            PresentOverlay();
+        });
+    }
 }
