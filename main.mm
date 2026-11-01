@@ -147,11 +147,12 @@ T CallGameFunction(uintptr_t rva, Args... args) {
     self.floatButton.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.8].CGColor;
     self.floatButton.exclusiveTouch = YES;
     
-    // Tách bạch hoàn toàn Tap và Kéo bằng event chuẩn
     [self.floatButton addTarget:self action:@selector(floatTapped:) forControlEvents:UIControlEventTouchUpInside];
     [self.floatButton addTarget:self action:@selector(floatTouchDown:) forControlEvents:UIControlEventTouchDown];
     [self.floatButton addTarget:self action:@selector(floatDragged:withEvent:) forControlEvents:UIControlEventTouchDragInside | UIControlEventTouchDragOutside];
-    [self.floatButton addTarget:self action:@selector(floatTouchEnded:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
+    [self.floatButton addTarget:self action:@selector(floatTouchEnded:) forControlEvents:UIControlEventTouchUpInside];
+    [self.floatButton addTarget:self action:@selector(floatTouchEnded:) forControlEvents:UIControlEventTouchUpOutside];
+    [self.floatButton addTarget:self action:@selector(floatTouchEnded:) forControlEvents:UIControlEventTouchCancel];
     
     [self.view addSubview:self.floatButton];
 }
@@ -275,7 +276,6 @@ T CallGameFunction(uintptr_t rva, Args... args) {
     self.scrollView.contentSize = CGSizeMake(300, y + 20);
 }
 
-// Layout ngang chuẩn xác dựa trên Tag phân loại riêng biệt
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     
@@ -323,7 +323,7 @@ T CallGameFunction(uintptr_t rva, Args... args) {
             rf.size.width = panelWidth - 28.0;
             sub.frame = rf;
             
-            CGFloat switchWidth = 51.0; // Chiều rộng chuẩn của UISwitch trên iOS
+            CGFloat switchWidth = 51.0;
             for (UIView *rSub in sub.subviews) {
                 if ([rSub isKindOfClass:[UISwitch class]]) {
                     CGRect sf = rSub.frame;
@@ -346,7 +346,6 @@ T CallGameFunction(uintptr_t rva, Args... args) {
             sf.origin.x = panelWidth - 80.0;
             sub.frame = sf;
         } else if ([sub isKindOfClass:[UILabel class]] && sub.tag != TagSection && sub.tag != TagValue) {
-            // Nhãn tiêu đề slider chừa chỗ cho nhãn giá trị bên phải
             CGRect sf = sub.frame;
             sf.origin.x = 16.0;
             sf.size.width = panelWidth - 95.0;
@@ -415,10 +414,11 @@ T CallGameFunction(uintptr_t rva, Args... args) {
     slider.minimumValue = min;
     slider.maximumValue = max;
     slider.value = val;
-    slider.tag = tag; // Gắn tag tính năng
+    slider.tag = tag;
     [slider addTarget:self action:@selector(sliderChanged:) forControlEvents:UIControlEventValueChanged];
     [slider addTarget:self action:@selector(sliderTouchUp:) forControlEvents:UIControlEventTouchUpInside];
-    [slider addTarget:self action:@selector(sliderTouchUp:) forControlEvents:UIControlEventUpOutside];
+    [slider addTarget:self action:@selector(sliderTouchUp:) forControlEvents:UIControlEventTouchUpOutside];
+    [slider addTarget:self action:@selector(sliderTouchUp:) forControlEvents:UIControlEventTouchCancel];
     [self.scrollView addSubview:slider];
     return y + 54;
 }
