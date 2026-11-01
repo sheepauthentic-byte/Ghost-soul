@@ -1111,7 +1111,7 @@ static void SetupRuntimeHooksWithRetry(int retriesLeft) {
 @end
 
 // ============================================================
-// WINDOW MANAGEMENT
+// WINDOW MANAGEMENT (DIRECT FALLBACK)
 // ============================================================
 
 static PassThroughWindow *gOverlayWindow = nil;
@@ -1129,37 +1129,35 @@ static void PresentOverlay(void) {
 
     UIWindowScene *activeScene = nil;
 
-    for (UIScene *scene
-         in UIApplication.sharedApplication.connectedScenes) {
-
-        if ([scene isKindOfClass:UIWindowScene.class] &&
-            scene.activationState ==
-                UISceneActivationStateForegroundActive) {
-
-            activeScene = (UIWindowScene *)scene;
-            break;
+    @try {
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if ([scene isKindOfClass:UIWindowScene.class] &&
+                scene.activationState ==
+                    UISceneActivationStateForegroundActive) {
+                activeScene = (UIWindowScene *)scene;
+                break;
+            }
         }
+    } @catch (__unused NSException *e) {}
+
+    if (activeScene) {
+        gOverlayWindow =
+            [[PassThroughWindow alloc]
+                initWithWindowScene:activeScene];
+        gOverlayWindow.frame = activeScene.coordinateSpace.bounds;
+    } else {
+        gOverlayWindow =
+            [[PassThroughWindow alloc]
+                initWithFrame:UIScreen.mainScreen.bounds];
     }
 
-    if (!activeScene) {
-        LOG_MESSAGE("No active UIWindowScene; overlay postponed.");
-        return;
-    }
-
-    gOverlayWindow =
-        [[PassThroughWindow alloc]
-            initWithWindowScene:activeScene];
-
-    gOverlayWindow.frame = activeScene.coordinateSpace.bounds;
     gOverlayWindow.backgroundColor = UIColor.clearColor;
     gOverlayWindow.windowLevel = UIWindowLevelAlert + 999;
-
     gOverlayWindow.rootViewController =
         [[OverlayController alloc] init];
-
     gOverlayWindow.hidden = NO;
 
-    LOG_MESSAGE("Overlay initialized with full hook engine.");
+    LOG_MESSAGE("Overlay initialized via direct fallback window.");
 }
 
 // ============================================================
@@ -1171,7 +1169,7 @@ static void sheepct_entry(void) {
     @autoreleasepool {
         SafeLogger::shared().initialize();
 
-        LOG_MESSAGE("Single-file Objective-C++ module loaded with live hooks.");
+        LOG_MESSAGE("Single-file Objective-C++ module loaded with direct fallback overlay.");
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             SetupRuntimeHooksWithRetry(3);
